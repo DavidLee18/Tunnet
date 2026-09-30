@@ -41,7 +41,7 @@ pub struct InviteCode {
 ///
 /// Trust is the genesis coordinator [`EndpointId`]. Overlay/TUN IPs are never
 /// dialed. When the snapshot includes a relay, IP candidates are omitted from
-/// this handshake address: iroh 1.2 treats IP as primary and relay as backup,
+/// this handshake address: iroh treats IP as primary and relay as backup,
 /// then `SendDatagram` uses only `selected_path`, so an unreachable IP starves
 /// a working relay for the rest of the QUIC handshake. The invite still stores
 /// the full snapshot. After join, the mesh endpoint discovers current paths.

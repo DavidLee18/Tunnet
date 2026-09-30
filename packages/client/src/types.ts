@@ -80,6 +80,7 @@ export interface NodeSummary {
   snapshot_version: number;
   networks: NetworkSummary[];
   on_demand?: OnDemandStatusInfo;
+  lookup?: LookupStatusInfo;
   control?: ControlPlaneStatusInfo;
 }
 
@@ -497,6 +498,20 @@ export interface OnDemandStatusInfo {
   reconnect_fail: number;
   packets_buffered: number;
   packets_dropped_timeout: number;
+  packets_dropped_blocked?: number;
+  dials_suppressed?: number;
+}
+
+/** Address-lookup outcomes since process start. */
+export interface LookupStatusInfo {
+  /** Lookups started. One lookup queries every configured service at once. */
+  lookups: number;
+  /** Lookups that ended without a single result. */
+  lookups_failed: number;
+  /** Results per service, keyed by iroh provenance (`mdns`, `pkarr`, `dns`). */
+  service_results: Record<string, number>;
+  /** Hard errors per service, keyed as in `service_results`. */
+  service_errors: Record<string, number>;
 }
 
 export interface DnsStatusInfo {

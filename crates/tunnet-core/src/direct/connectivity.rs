@@ -265,7 +265,7 @@ pub fn strip_overlay_addrs(mut addr: EndpointAddr, overlay_nets: &[Ipv4Net]) -> 
 
 /// Do not publish overlay interface addresses as iroh underlay candidates.
 ///
-/// iroh 1.2 `AddrFilter` applies to address *publish*. It does not filter
+/// `AddrFilter` applies to address *publish*. It does not filter
 /// QNT/handshake candidates on an existing connection (n0-computer/iroh#4399).
 pub fn apply_overlay_addr_filter(builder: Builder, overlay_nets: &[Ipv4Net]) -> Builder {
     if overlay_nets.is_empty() {

@@ -5,7 +5,7 @@
 //! newline-delimited IPC protocol and are consumed by the `tunnet-client` crate,
 //! the `tunnet` CLI, and future desktop integrations.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::Ipv4Addr;
 
 use serde::{Deserialize, Serialize};
@@ -209,6 +209,8 @@ pub struct NodeSummary {
     pub networks: Vec<NetworkSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_demand: Option<OnDemandStatusInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookup: Option<LookupStatusInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control: Option<ControlPlaneStatusInfo>,
 }
@@ -967,6 +969,29 @@ pub struct OnDemandStatusInfo {
     pub packets_dropped_blocked: u64,
     #[serde(default)]
     pub dials_suppressed: u64,
+}
+
+/// Address-lookup outcomes since process start.
+///
+/// Discovery is a per-network toggle, so a service that silently stops
+/// resolving looks exactly like a peer that is offline. These are the only
+/// counters that distinguish the two.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct LookupStatusInfo {
+    /// Lookups started. One lookup queries every configured service at once.
+    pub lookups: u64,
+    /// Lookups that ended without a single result. This, not `service_errors`,
+    /// is the signal that discovery is failing: a service that simply has no
+    /// answer for a peer yields nothing and reports no error.
+    pub lookups_failed: u64,
+    /// Results yielded per service, keyed by iroh provenance (`mdns`, `pkarr`,
+    /// `dns`). Always carries the known services, so a zero reads as
+    /// "contributed nothing" rather than "not configured".
+    pub service_results: BTreeMap<String, u64>,
+    /// Hard errors raised per service, keyed as in `service_results`. Stays at
+    /// zero for a service that is reachable but has no entry for a peer.
+    pub service_errors: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

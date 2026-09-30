@@ -361,7 +361,7 @@ pub async fn persist_direct_join(
             .context("resolve Direct relay policy")?;
     crate::host_constraints::constrain_lan(&mut connectivity);
     let dial = tunnet_core::direct::join_dial_addr(&invite).context("coordinator dial address")?;
-    // iroh 1.2 `SendDatagram` uses only `selected_path` once an IP path exists.
+    // `SendDatagram` uses only `selected_path` once an IP path exists.
     // Unreachable join-client IPs (emulator NAT, CGNAT) then starve a working
     // relay for the rest of the handshake. This ephemeral endpoint is relay-only;
     // the mesh endpoint created after admission still binds IP + discovery.

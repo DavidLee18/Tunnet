@@ -147,9 +147,9 @@ impl PeerSlot {
         true
     }
 
-    fn take_buf(&mut self) -> Vec<Bytes> {
+    fn take_buf(&mut self) -> VecDeque<Bytes> {
         self.buffer_bytes = 0;
-        self.buffer.drain(..).collect()
+        std::mem::take(&mut self.buffer)
     }
 
     fn drop_buf(&mut self) -> usize {
@@ -1143,7 +1143,7 @@ impl ConnPool {
                 }
                 let generation = self.gate_generation();
                 let local = self.endpoint.id();
-                let (canonical, buffered, fire_hook) = {
+                let (canonical, mut buffered, fire_hook) = {
                     let mut guard = slot.lock().await;
                     if let Some(existing) = guard.live_conn() {
                         let existing_by_us = guard.opened_by_us;
@@ -1188,11 +1188,9 @@ impl ConnPool {
                     }
                 };
 
-                for pkt in buffered {
-                    if let Err(e) = send_datagram(&canonical, pkt).await {
-                        tracing::debug!(%peer, ?e, "flush buffered datagram failed");
-                    }
-                }
+                // Flush before the tunnel hook so buffered traffic is already
+                // queued by the time reverse traffic can arrive.
+                send_datagram_batch(&canonical, &mut buffered).await;
                 if fire_hook {
                     self.fire_tunnel_hook(peer, canonical.clone());
                 }
@@ -1643,6 +1641,52 @@ pub async fn send_datagram(conn: &Connection, packet: Bytes) -> anyhow::Result<(
     conn.send_datagram(packet)
         .context("send_datagram (packet too big or unsupported)")?;
     Ok(())
+}
+
+/// Datagrams queued per [`Connection::send_many_datagrams`] call.
+///
+/// That call takes its whole argument under one connection lock hold and wakes
+/// the QUIC driver once, so the saving scales with batch size. Capped so a
+/// post-dial flush cannot hold the lock across an entire buffer.
+const SEND_BATCH_MAX: usize = 32;
+
+/// Drain `queue` into `conn`, batching the head that fits the send buffer.
+///
+/// Same per-packet contract as [`send_datagram`]: an oversized packet is dropped
+/// and the rest still go out, and packets past the current send-buffer space
+/// wait for room rather than being dropped. Every packet is popped, so `queue`
+/// is always emptied. Returns how many packets the connection accepted.
+pub async fn send_datagram_batch(conn: &Connection, queue: &mut VecDeque<Bytes>) -> usize {
+    // The batch must be a contiguous head of the queue: `send_many_datagrams`
+    // rejects the whole argument if any member is oversized, so stop at the
+    // first one and let the per-packet path below report and drop it.
+    let mut space = conn.datagram_send_buffer_space();
+    let mut batch: Vec<Bytes> = Vec::new();
+    while batch.len() < SEND_BATCH_MAX && space > 0 {
+        let Some(front) = queue.front() else { break };
+        if conn
+            .max_datagram_size()
+            .is_some_and(|max| front.len() > max)
+        {
+            break;
+        }
+        space = space.saturating_sub(front.len());
+        batch.push(queue.pop_front().expect("front checked"));
+    }
+
+    // Fire-and-forget, like `send_datagram`: a rejected or short batch means
+    // those datagrams were dropped, not that the connection is broken.
+    let mut accepted = 0;
+    if !batch.is_empty() {
+        accepted = conn.send_many_datagrams(&batch).unwrap_or(0);
+    }
+
+    while let Some(packet) = queue.pop_front() {
+        if send_datagram(conn, packet).await.is_ok() {
+            accepted += 1;
+        }
+    }
+    accepted
 }
 
 #[cfg(test)]
@@ -2162,5 +2206,117 @@ mod tests {
         }
         assert_eq!(pool.on_demand_stats().reconnect_attempts, 0);
         assert!(pool.on_demand_stats().dials_suppressed > 0);
+    }
+
+    /// A post-dial flush must put every buffered packet on the wire and leave
+    /// the queue empty, whichever side of `SEND_BATCH_MAX` the burst falls on.
+    #[tokio::test]
+    async fn send_datagram_batch_drains_queue() {
+        for count in [1, SEND_BATCH_MAX, SEND_BATCH_MAX + 5] {
+            assert_batch_roundtrip(count).await;
+        }
+    }
+
+    async fn assert_batch_roundtrip(count: usize) {
+        let server = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .bind()
+            .await
+            .expect("bind server");
+        let client = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .bind()
+            .await
+            .expect("bind client");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<u8>(count * 2);
+        let accept = tokio::spawn({
+            let server = server.clone();
+            async move {
+                while let Some(incoming) = server.accept().await {
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let Ok(conn) = incoming.await else { return };
+                        let mut batch: [Bytes; SEND_BATCH_MAX] =
+                            std::array::from_fn(|_| Bytes::new());
+                        while let Ok(n) = conn.read_many_datagrams(&mut batch).await {
+                            for dg in &batch[..n] {
+                                if tx.send(dg[0]).await.is_err() {
+                                    return;
+                                }
+                            }
+                            batch[n..].fill(Bytes::new());
+                        }
+                    });
+                }
+            }
+        });
+
+        let conn = client
+            .connect(server.addr(), TEST_ALPN)
+            .await
+            .expect("connect");
+
+        let mut queue: VecDeque<Bytes> =
+            (0..count).map(|i| Bytes::from(vec![i as u8; 64])).collect();
+        let accepted = send_datagram_batch(&conn, &mut queue).await;
+        assert_eq!(accepted, count, "every queued datagram should be accepted");
+        assert!(queue.is_empty(), "queue must always be drained");
+
+        let mut received = Vec::with_capacity(count);
+        for _ in 0..count {
+            received.push(
+                tokio::time::timeout(Duration::from_secs(15), rx.recv())
+                    .await
+                    .expect("datagram arrives")
+                    .expect("channel open"),
+            );
+        }
+        assert_eq!(received, (0..count).map(|i| i as u8).collect::<Vec<_>>());
+
+        accept.abort();
+    }
+
+    /// An oversized packet must not fail the packets queued behind it.
+    #[tokio::test]
+    async fn send_datagram_batch_skips_oversized() {
+        let server = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .bind()
+            .await
+            .expect("bind server");
+        let client = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .bind()
+            .await
+            .expect("bind client");
+        let accept = tokio::spawn({
+            let server = server.clone();
+            async move {
+                while let Some(incoming) = server.accept().await {
+                    tokio::spawn(async move {
+                        if let Ok(conn) = incoming.await {
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                            drop(conn);
+                        }
+                    });
+                }
+            }
+        });
+
+        let conn = client
+            .connect(server.addr(), TEST_ALPN)
+            .await
+            .expect("connect");
+        let max = conn.max_datagram_size().expect("datagrams enabled");
+
+        let mut queue: VecDeque<Bytes> = VecDeque::from([
+            Bytes::from(vec![1u8; 64]),
+            Bytes::from(vec![0u8; max + 1]),
+            Bytes::from(vec![2u8; 64]),
+        ]);
+        let accepted = send_datagram_batch(&conn, &mut queue).await;
+        assert_eq!(accepted, 2, "the oversized packet is dropped, not retried");
+        assert!(queue.is_empty(), "queue must always be drained");
+
+        accept.abort();
     }
 }

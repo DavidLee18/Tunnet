@@ -470,6 +470,26 @@ fn print_status(
         ));
     }
 
+    if let Some(lookup) = &node.lookup
+        && lookup.lookups > 0
+    {
+        let contributors = lookup
+            .service_results
+            .iter()
+            .filter(|(_, n)| **n > 0)
+            .map(|(service, n)| format!("{service} {n}"))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let mut line = format!(
+            "  discovery  {} lookups · {} failed",
+            lookup.lookups, lookup.lookups_failed
+        );
+        if !contributors.is_empty() {
+            line.push_str(&format!(" · {contributors}"));
+        }
+        out.writeln(line);
+    }
+
     for net in &node.networks {
         out.writeln("");
         print_network_section(out, net, peers_by_network.get(&net.network_id));

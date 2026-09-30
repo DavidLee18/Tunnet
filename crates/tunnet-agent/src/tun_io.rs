@@ -19,6 +19,14 @@ use crate::actors::dataplane::PublishedPlane;
 use crate::metrics::AgentMetrics;
 use crate::qos::{self, OutboundScheduler};
 
+/// Datagrams taken from the connection per read.
+///
+/// `read_many_datagrams` drains its whole argument under one connection lock
+/// hold, so an ingress burst costs one lock instead of one per packet. Sized to
+/// hold a forwarding window at tunnel MTU without parking a large buffer on
+/// every reader.
+const INGRESS_BATCH: usize = 32;
+
 /// Ask the app's `VpnService` to establish a tunnel, then adopt its descriptor.
 ///
 /// The interface name is meaningless on Android (the framework names it `tunN`)
@@ -319,16 +327,17 @@ pub async fn serve_tunnel_connection(deps: InboundDeps) {
     // Pinned at reader start: this task never observes a newer generation.
     tracing::debug!(generation = plane.generation, %remote_id, "ingress reader pinned");
 
-    loop {
+    let mut batch: [Bytes; INGRESS_BATCH] = std::array::from_fn(|_| Bytes::new());
+    'read: loop {
         if generation_cancel.is_cancelled() {
             break;
         }
         // Cancellation first so BringDown promptly stops old readers.
-        let dg = tokio::select! {
+        let received = tokio::select! {
             biased;
             _ = generation_cancel.cancelled() => break,
-            res = conn.read_datagram() => match res {
-                Ok(dg) => dg,
+            res = conn.read_many_datagrams(&mut batch) => match res {
+                Ok(n) => n,
                 Err(e) => {
                     tracing::debug!(?e, "read_datagram closed");
                     break;
@@ -338,13 +347,15 @@ pub async fn serve_tunnel_connection(deps: InboundDeps) {
         if generation_cancel.is_cancelled() {
             break;
         }
-        {
+        // Release the previous round's datagrams before holding the new ones.
+        batch[received..].fill(Bytes::new());
+        for dg in &batch[..received] {
             #[allow(clippy::collapsible_if)]
             if let Some(p) = &pool {
                 p.touch_peer(remote_id);
             }
 
-            let pkt = match packet::parse(&dg) {
+            let pkt = match packet::parse(dg) {
                 Ok(p) => p,
                 Err(e) => {
                     drop_parse(&metrics, e);
@@ -417,10 +428,10 @@ pub async fn serve_tunnel_connection(deps: InboundDeps) {
             // generation loaded at reader start. Recheck cancellation
             // (not a lock) before the send so BringDown wins races.
             if generation_cancel.is_cancelled() {
-                break;
+                break 'read;
             }
             #[cfg(feature = "ssh")]
-            let send_result = if crate::ssh::rewrite_inbound_needed(&dg, &ssh_intercept) {
+            let send_result = if crate::ssh::rewrite_inbound_needed(dg, &ssh_intercept) {
                 let mut packet = dg.to_vec();
                 let _ = crate::ssh::rewrite_inbound(&mut packet, &ssh_intercept);
                 device.send(&packet).await
@@ -432,7 +443,7 @@ pub async fn serve_tunnel_connection(deps: InboundDeps) {
             if let Err(e) = send_result {
                 tracing::warn!(?e, "tun send failed");
                 metrics.dropped_inc("tun_send_failed");
-                break;
+                break 'read;
             }
             metrics.packets_inc("in");
             metrics.bytes_add("in", n);

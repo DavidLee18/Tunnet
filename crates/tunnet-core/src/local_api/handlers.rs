@@ -1,5 +1,6 @@
 //! Local Management API business logic (formerly IPC dispatch handlers).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,9 +13,10 @@ use tunnet_common::local_api::{
     API_VERSION, ApiError, ApiErrorCode, ControlPlaneStatusInfo, DiagInfo,
     DirectFirewallPendingResponse, DirectFirewallResponse, DirectFirewallRuleInfo,
     DirectPendingInfo, DirectPolicyResponse, DnsStatusInfo, ExitNodeRouteInfo, HostnameRouteInfo,
-    LocalEvent, MetaInfo, NetcheckInfo, NetcheckItem, NetworkSummary, NodeModeApi, NodeSummary,
-    OkResponse, OnDemandStatusInfo, PeerSummary, PingEvent, PingProbe, PingSummary, RoutesInfo,
-    ServeInfo, SshRecordingInfo, SshSessionInfo, SubnetRouteInfo, TransferInfo, TunnelInfo,
+    LocalEvent, LookupStatusInfo, MetaInfo, NetcheckInfo, NetcheckItem, NetworkSummary,
+    NodeModeApi, NodeSummary, OkResponse, OnDemandStatusInfo, PeerSummary, PingEvent, PingProbe,
+    PingSummary, RoutesInfo, ServeInfo, SshRecordingInfo, SshSessionInfo, SubnetRouteInfo,
+    TransferInfo, TunnelInfo,
 };
 
 use super::auth::PeerIdentity;
@@ -420,6 +422,40 @@ fn iroh_relay_status(endpoint: &iroh::Endpoint) -> String {
     }
 }
 
+/// Address-lookup counters for the services this endpoint can attach.
+///
+/// iroh labels results by service provenance. The keys below cover every
+/// service Tunnet configures: `mdns` from `MdnsAddressLookup`, and `pkarr` /
+/// `dns` from the mainline DHT lookup and the n0 preset. A service outside the
+/// list still counts toward the totals; it just gets no per-service entry.
+fn iroh_lookup_status(endpoint: &iroh::Endpoint) -> LookupStatusInfo {
+    const SERVICES: [&str; 3] = ["mdns", "pkarr", "dns"];
+
+    use iroh::address_lookup::ServiceLabels;
+    let metrics = &endpoint.metrics().address_lookup;
+    let mut service_results = BTreeMap::new();
+    let mut service_errors = BTreeMap::new();
+    for service in SERVICES {
+        let labels = ServiceLabels::new(service);
+        let results = metrics
+            .service_results
+            .get(&labels)
+            .map_or(0, |counter| counter.get());
+        let errors = metrics
+            .service_errors
+            .get(&labels)
+            .map_or(0, |counter| counter.get());
+        service_results.insert(service.to_string(), results);
+        service_errors.insert(service.to_string(), errors);
+    }
+    LookupStatusInfo {
+        lookups: metrics.lookups.get(),
+        lookups_failed: metrics.lookups_failed.get(),
+        service_results,
+        service_errors,
+    }
+}
+
 pub(crate) fn peer_summaries(
     state: &LocalApiState,
     network_id: Option<uuid::Uuid>,
@@ -595,6 +631,7 @@ pub(crate) fn node_summary_from_observation(
             })
             .collect(),
         on_demand: None,
+        lookup: None,
         control: None,
     }
 }
@@ -653,6 +690,7 @@ pub(crate) fn build_node_summary(state: &LocalApiState) -> NodeSummary {
             packets_dropped_blocked: od.packets_dropped_blocked,
             dials_suppressed: od.dials_suppressed,
         }),
+        lookup: Some(iroh_lookup_status(&state.node.endpoint)),
         control,
     };
     if let Some(observe) = &state.mesh_observe {
@@ -729,6 +767,7 @@ pub(crate) fn idle_node_summary(daemon_version: &str) -> NodeSummary {
         snapshot_version: 0,
         networks: vec![],
         on_demand: None,
+        lookup: None,
         control: None,
     }
 }
@@ -1630,5 +1669,83 @@ pub(crate) fn direct_keep_alive(
             state.node.pool.set_peer_keep_alive(peer.endpoint, false);
         }
         Ok(format!("Keep-alive disabled for {hostname}"))
+    }
+}
+
+#[cfg(test)]
+mod lookup_status_tests {
+    use super::iroh_lookup_status;
+    use futures_util::{StreamExt, stream};
+    use iroh::address_lookup::memory::MemoryLookup;
+    use iroh::address_lookup::{AddressLookup, EndpointData, EndpointInfo, Error, Item};
+    use iroh::endpoint::Endpoint;
+    use iroh::{EndpointId, SecretKey, TransportAddr};
+
+    type LookupStream =
+        std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<Item, Error>> + Send + 'static>>;
+
+    /// An address lookup that always errors, so the per-service error counter
+    /// can be told apart from a service that simply has nothing to say.
+    #[derive(Debug)]
+    struct FailingAddressLookup;
+
+    impl AddressLookup for FailingAddressLookup {
+        fn resolve(&self, _endpoint_id: EndpointId) -> Option<LookupStream> {
+            Some(
+                stream::once(async {
+                    Err(Error::from_err(
+                        "pkarr",
+                        std::io::Error::other("simulated resolver failure"),
+                    ))
+                })
+                .boxed(),
+            )
+        }
+    }
+
+    /// A resolving service must show up per-service, a service that stays
+    /// silent must only move the failure total, and a service that errors must
+    /// move its own error counter.
+    #[tokio::test]
+    async fn reports_results_failures_and_errors_per_service() {
+        let known = MemoryLookup::with_provenance("mdns");
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .address_lookup(known.clone())
+            .address_lookup(MemoryLookup::with_provenance("dns"))
+            .address_lookup(FailingAddressLookup)
+            .bind()
+            .await
+            .expect("bind endpoint");
+
+        let fresh = iroh_lookup_status(&endpoint);
+        assert_eq!(fresh.lookups, 0);
+        assert_eq!(fresh.lookups_failed, 0);
+        assert_eq!(fresh.service_results["mdns"], 0);
+        assert_eq!(fresh.service_errors["pkarr"], 0);
+
+        let resolved = SecretKey::generate().public();
+        known.add_endpoint_info(EndpointInfo::from_parts(
+            resolved,
+            EndpointData::from_iter([TransportAddr::Ip("127.0.0.1:1".parse().unwrap())]),
+        ));
+        let unknown = SecretKey::generate().public();
+
+        let services = endpoint.address_lookup().expect("services");
+        let _: Vec<_> = services.resolve(resolved).collect().await;
+        let _: Vec<_> = services.resolve(unknown).collect().await;
+
+        let status = iroh_lookup_status(&endpoint);
+        assert_eq!(status.lookups, 2);
+        assert_eq!(status.lookups_failed, 1, "only the unknown peer fails");
+        assert_eq!(status.service_results["mdns"], 1);
+        assert_eq!(
+            status.service_results["dns"], 0,
+            "a service with nothing to say yields no result and no error"
+        );
+        assert_eq!(status.service_errors["dns"], 0);
+        assert_eq!(
+            status.service_errors["pkarr"], 2,
+            "the failing service errors on both lookups"
+        );
     }
 }

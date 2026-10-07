@@ -408,6 +408,35 @@ impl TunnetNode {
         }
     }
 
+    /// Dial `tunnet/tunnel/1` to every known peer so agent keep-alive can mark this
+    /// SDK node connected. Safe to call repeatedly; failures are returned as a count.
+    ///
+    /// Fargate has no TUN, so peers never send overlay packets here. Without this
+    /// outbound poke the coordinator shows the node as suspended even while
+    /// [`Self::open_stream`] works.
+    pub async fn warm_datagram_tunnels(&self) -> usize {
+        let NodeInner::Coordinator { node, .. } = &*self.inner else {
+            return 0;
+        };
+        let self_hex = node.endpoint_id_hex();
+        let mut ok = 0usize;
+        for p in node.routes.peers() {
+            if p.endpoint_hex == self_hex {
+                continue;
+            }
+            match node.tunnel_pool.get(p.endpoint).await {
+                Ok(_) => {
+                    ok += 1;
+                    tracing::debug!(peer = %p.hostname, "warmed datagram tunnel");
+                }
+                Err(e) => {
+                    tracing::debug!(peer = %p.hostname, error = %e, "warm datagram tunnel failed");
+                }
+            }
+        }
+        ok
+    }
+
     /// Take the inbound stream listener (once).
     ///
     /// Returns [`Error::ListenerUnavailable`] in client mode and
@@ -625,6 +654,15 @@ fn spawn_stream_acceptor(
         let tx = inbound_tx.clone();
         let routes = routes.clone();
         Box::pin(async move {
+            if accepted.header.host == tunnet_core::ping::PING_HOST {
+                let _ = tunnet_core::ping::handle_inbound_ping(
+                    &accepted.header,
+                    accepted.send,
+                    accepted.recv,
+                )
+                .await;
+                return;
+            }
             let peer = routes
                 .lookup_endpoint(&accepted.peer_hex)
                 .map(|p| Peer::from_peer_info(&p))

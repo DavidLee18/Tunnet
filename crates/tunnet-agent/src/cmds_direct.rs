@@ -262,7 +262,8 @@ pub async fn run_create(args: CreateArgs, state_dir: Option<&str>) -> anyhow::Re
             role: MemberRole::Coordinator,
             network_epoch: 0,
             issued_at: jiff::Timestamp::now(),
-            expires_at: jiff::Timestamp::now().checked_add(jiff::Span::new().days(3650))?,
+            expires_at: jiff::Timestamp::now()
+                .checked_add(jiff::SignedDuration::from_secs(3650 * 86400))?,
             content_key: content_key.clone(),
             sig: String::new(),
         },

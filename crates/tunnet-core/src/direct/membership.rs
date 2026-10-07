@@ -29,7 +29,7 @@ use iroh_docs::protocol::Docs;
 use iroh_docs::store::Query;
 use iroh_docs::{AuthorId, DocTicket, NamespaceId};
 use iroh_gossip::net::Gossip;
-use jiff::{Span, Timestamp};
+use jiff::{SignedDuration, Timestamp};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tunnet_common::DnsConfig;
@@ -450,7 +450,7 @@ impl DocsMembership {
                 role,
                 network_epoch: epoch,
                 issued_at: now,
-                expires_at: now.checked_add(Span::new().days(3650))?,
+                expires_at: now.checked_add(SignedDuration::from_secs(3650 * 86400))?,
                 content_key: self.inner.content_key.clone(),
                 sig: String::new(),
             },

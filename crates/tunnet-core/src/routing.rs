@@ -63,6 +63,10 @@ pub struct Tables {
     pub hostname_wildcards: Vec<Arc<HostnameRouteInfo>>,
     /// Hostname routes this node itself advertises (local resolve + proxy).
     pub advertised_hostnames: Vec<Arc<HostnameRouteInfo>>,
+    /// This node's mesh hostnames (lowercased), from membership `self_endpoint_id`.
+    pub self_hostnames: Vec<String>,
+    /// This node's overlay IPs.
+    pub self_ips: Vec<Ipv4Addr>,
     /// Synthetic IP → hostname (PeerDNS hostname-route answers).
     pub synthetic_hosts: std::collections::HashMap<Ipv4Addr, String>,
     pub dns_suffix: String,
@@ -105,6 +109,8 @@ impl RoutingTable {
                 hostname_exact: Default::default(),
                 hostname_wildcards: Default::default(),
                 advertised_hostnames: Default::default(),
+                self_hostnames: Default::default(),
+                self_ips: Default::default(),
                 synthetic_hosts: Default::default(),
                 dns_suffix: "tunnet".into(),
                 network_name: String::new(),
@@ -216,6 +222,48 @@ impl RoutingTable {
             .advertised
             .iter()
             .any(|net| net.contains(ip))
+    }
+
+    /// True when `host` names this node (mesh hostname, PeerDNS FQDN, overlay IP, or loopback).
+    ///
+    /// Direct SDK `open_stream("picwmc", 443)` puts that hostname in the stream header. tunnetd
+    /// should TCP-proxy to `127.0.0.1:443`, not treat it as a LAN/hostname-route advertisement.
+    pub fn is_local_stream_target(&self, host: &str) -> bool {
+        let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        if h.is_empty() || h == "localhost" || h == "127.0.0.1" || h == "::1" {
+            return true;
+        }
+        if let Ok(ip) = h.parse::<Ipv4Addr>() {
+            return ip.is_loopback() || self.is_self_ip(&ip);
+        }
+        self.is_self_hostname(&h)
+    }
+
+    pub fn is_self_ip(&self, ip: &Ipv4Addr) -> bool {
+        self.inner.load().self_ips.contains(ip)
+    }
+
+    pub fn is_self_hostname(&self, host: &str) -> bool {
+        let tables = self.inner.load();
+        let suffix = format!(".{}", tables.dns_suffix);
+        let lower = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        let bare = lower
+            .strip_suffix(&suffix)
+            .unwrap_or(lower.as_str())
+            .trim_end_matches('.');
+        let network_suffix = if tables.network_name.is_empty() {
+            None
+        } else {
+            Some(format!(".{}", tables.network_name))
+        };
+        let peer_name = network_suffix
+            .as_ref()
+            .and_then(|s| bare.strip_suffix(s.as_str()))
+            .unwrap_or(bare);
+        tables
+            .self_hostnames
+            .iter()
+            .any(|s| s == &lower || s == bare || s == peer_name)
     }
 
     /// True when this node is the gateway for a hostname route matching `host`.
@@ -559,6 +607,8 @@ impl RoutingTable {
             std::collections::HashMap::new();
         let mut hostname_wildcards = Vec::new();
         let mut advertised_hostnames = Vec::new();
+        let mut self_hostnames = Vec::new();
+        let mut self_ips = Vec::new();
         let mut synthetic_hosts: std::collections::HashMap<Ipv4Addr, String> =
             std::collections::HashMap::new();
         let mut exit_node = None;
@@ -593,6 +643,17 @@ impl RoutingTable {
                     if let Some(ov) = self.overrides.get(&(*network_id, key)) {
                         ip = *ov;
                         break;
+                    }
+                }
+                if p.endpoint_id == slice.self_endpoint_id {
+                    if !p.hostname.is_empty() {
+                        let hn = p.hostname.to_ascii_lowercase();
+                        if !self_hostnames.contains(&hn) {
+                            self_hostnames.push(hn);
+                        }
+                    }
+                    if !self_ips.contains(&ip) {
+                        self_ips.push(ip);
                     }
                 }
                 let info = Arc::new(PeerInfo {
@@ -734,6 +795,8 @@ impl RoutingTable {
             hostname_exact,
             hostname_wildcards,
             advertised_hostnames,
+            self_hostnames,
+            self_ips,
             synthetic_hosts,
             dns_suffix,
             network_name: primary_network_name,
@@ -977,6 +1040,13 @@ mod tests {
             table.resolve_dns_ptr(self_ip).as_deref(),
             Some("desktop-t85djls.default.tunnet")
         );
+        assert!(table.is_local_stream_target("desktop-t85djls"));
+        assert!(table.is_local_stream_target("desktop-t85djls.tunnet"));
+        assert!(table.is_local_stream_target("desktop-t85djls.default.tunnet"));
+        assert!(table.is_local_stream_target("10.7.0.3"));
+        assert!(table.is_local_stream_target("127.0.0.1"));
+        assert!(table.is_local_stream_target("localhost"));
+        assert!(!table.is_local_stream_target("other-peer"));
     }
 
     #[test]

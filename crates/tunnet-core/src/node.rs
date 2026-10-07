@@ -1006,3 +1006,31 @@ async fn bootstrap_one_direct_network(
         secret_updated,
     })
 }
+
+#[cfg(all(test, any(feature = "managed", feature = "direct")))]
+mod alpn_tests {
+    use super::*;
+
+    #[test]
+    fn sdk_default_does_not_advertise_datagram_alpn() {
+        let alpns = build_alpns(&CoreNodeConfig::default(), true, true);
+        assert!(
+            !alpns.iter().any(|a| a.as_slice() == TUNNEL_ALPN),
+            "SDK default must not advertise tunnet/tunnel/1"
+        );
+        assert!(alpns.iter().any(|a| a.as_slice() == TUNNEL_STREAM_ALPN));
+    }
+
+    #[test]
+    fn advertise_datagram_alpn_includes_tunnel() {
+        let cfg = CoreNodeConfig {
+            advertise_datagram_alpn: true,
+            ..Default::default()
+        };
+        let alpns = build_alpns(&cfg, true, true);
+        assert!(
+            alpns.iter().any(|a| a.as_slice() == TUNNEL_ALPN),
+            "keep-alive peers need tunnet/tunnel/1 advertised"
+        );
+    }
+}

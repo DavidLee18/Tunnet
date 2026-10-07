@@ -34,6 +34,9 @@ pub struct TunnetNodeBuilder {
     poll_secs: Option<u64>,
     process_name: Option<String>,
     runtime: Option<String>,
+    /// Advertise and accept `tunnet/tunnel/1` so agent keep-alive can mark this node connected.
+    /// Incoming datagrams are drained (no TUN). Default false.
+    advertise_datagram_alpn: bool,
 }
 
 impl TunnetNodeBuilder {
@@ -100,6 +103,16 @@ impl TunnetNodeBuilder {
     /// Optional runtime metadata.
     pub fn runtime(mut self, runtime: impl Into<String>) -> Self {
         self.runtime = Some(runtime.into());
+        self
+    }
+
+    /// Advertise and accept datagram tunnel ALPN (`tunnet/tunnel/1`).
+    ///
+    /// Agent keep-alive dials that ALPN. Without it, `tunnet status` shows this SDK node
+    /// as suspended even while `open_stream` works. There is no TUN: accepted datagrams
+    /// are discarded so the QUIC connection stays up.
+    pub fn advertise_datagram_alpn(mut self, advertise: bool) -> Self {
+        self.advertise_datagram_alpn = advertise;
         self
     }
 
@@ -200,7 +213,7 @@ impl TunnetNode {
             poll_secs,
             kind: "sdk",
             agent_version: env!("CARGO_PKG_VERSION"),
-            advertise_datagram_alpn: false,
+            advertise_datagram_alpn: cfg.advertise_datagram_alpn,
             ..Default::default()
         };
 
@@ -275,12 +288,13 @@ impl TunnetNode {
         core_cfg: CoreNodeConfig,
         sock_path: PathBuf,
     ) -> Result<Self> {
+        let advertise_datagram_alpn = core_cfg.advertise_datagram_alpn;
         let node = CoreNode::bootstrap(identity, persisted, paths, core_cfg)
             .await
             .map_err(Error::from_anyhow)?;
         let node = Arc::new(node);
         let (tx, rx) = mpsc::channel(64);
-        let router = spawn_stream_acceptor(node.clone(), tx);
+        let router = spawn_stream_acceptor(node.clone(), tx, advertise_datagram_alpn);
         Ok(Self {
             inner: Arc::new(NodeInner::Coordinator {
                 node,
@@ -567,9 +581,41 @@ fn resolve_peer(node: &CoreNode, host: &str) -> Option<Arc<tunnet_core::PeerInfo
         .or_else(|| node.routes.lookup_endpoint(host))
 }
 
+/// Accept `tunnet/tunnel/1` without a TUN: adopt into the datagram pool and drain
+/// payloads so agent keep-alive stays connected.
+#[derive(Clone)]
+struct DatagramKeepAliveHandler {
+    pool: tunnet_core::ConnPool,
+}
+
+impl std::fmt::Debug for DatagramKeepAliveHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatagramKeepAliveHandler")
+            .finish_non_exhaustive()
+    }
+}
+
+impl iroh::protocol::ProtocolHandler for DatagramKeepAliveHandler {
+    async fn accept(
+        &self,
+        conn: iroh::endpoint::Connection,
+    ) -> std::result::Result<(), iroh::protocol::AcceptError> {
+        let peer = conn.remote_id();
+        if !self.pool.adopt(peer, conn.clone()).await {
+            tracing::debug!(%peer, "datagram keep-alive accept lost tie-break");
+            conn.close(0u32.into(), b"tie_break");
+            return Ok(());
+        }
+        tracing::debug!(%peer, "accepted datagram ALPN (no TUN; drain only)");
+        while conn.read_datagram().await.is_ok() {}
+        Ok(())
+    }
+}
+
 fn spawn_stream_acceptor(
     node: Arc<CoreNode>,
     inbound_tx: mpsc::Sender<InboundConnection>,
+    advertise_datagram_alpn: bool,
 ) -> iroh::protocol::Router {
     use iroh::protocol::Router;
     use tunnet_core::StreamProtocolHandler;
@@ -595,10 +641,19 @@ fn spawn_stream_acceptor(
         })
     });
 
-    let builder = Router::builder(node.endpoint.clone()).accept(
+    let mut builder = Router::builder(node.endpoint.clone()).accept(
         tunnet_core::TUNNEL_STREAM_ALPN,
         StreamProtocolHandler::new(handler),
     );
+
+    if advertise_datagram_alpn {
+        builder = builder.accept(
+            tunnet_common::TUNNEL_ALPN,
+            DatagramKeepAliveHandler {
+                pool: node.tunnel_pool.clone(),
+            },
+        );
+    }
 
     #[cfg(feature = "send")]
     let builder = {
